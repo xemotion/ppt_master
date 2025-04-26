@@ -1,0 +1,22 @@
+{
+  "total_slides": 1,
+  "slides": [
+    {
+      "slide_number": 1,
+      "layout_name": "Blank",
+      "objects": [
+        {
+          "type": "text_object",
+          "content": "테스트 텍스트",
+          "position": {
+            "top": 914400,
+            "left": 914400,
+            "width": 7315200,
+            "height": 914400
+          },
+          "description": "상단에 위치한 큰 본문을 위한 객체"
+        }
+      ]
+    }
+  ]
+}
