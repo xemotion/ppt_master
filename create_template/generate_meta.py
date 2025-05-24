@@ -6,16 +6,14 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI
 from typing import Dict, Any
 
-def get_shape_position(shape, slide_width, slide_height):
-    return {
-        "left_percent": round((shape.left / slide_width) * 100, 2),
-        "top_percent": round((shape.top / slide_height) * 100, 2),
-        "width_percent": round((shape.width / slide_width) * 100, 2),
-        "height_percent": round((shape.height / slide_height) * 100, 2)
-    }
-
-def get_type_info(shape):
-    return MSO_SHAPE_TYPE(shape.shape_type).name
+# 공통 모듈에서 함수 가져오기
+from ppt_common import (
+    get_shape_position,
+    get_type_info,
+    make_element_id,
+    is_tag_or_label,
+    logger
+)
 
 def determine_element_role(shape, pos, slide_number, slide_width, slide_height, shape_type):
     """
@@ -87,10 +85,6 @@ def determine_element_role(shape, pos, slide_number, slide_width, slide_height, 
     # 일반적인 이름 생성 (슬라이드 번호 제외)
     return f"{vertical_pos}_{horizontal_pos}_{size}_{functional_role}"
 
-def make_element_id(slide_number, pos, type_name):
-    """레거시 방식으로 요소 ID 생성 (기술적 위치 정보 기반)"""
-    return f"element_slide{slide_number}_l{int(pos['left_percent'])}_t{int(pos['top_percent'])}_w{int(pos['width_percent'])}_h{int(pos['height_percent'])}_type{type_name}"
-
 def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name):
     """
     텍스트 요소에 대한 역할과 설명을 생성합니다.
@@ -110,6 +104,22 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
         tuple: (역할 이름, 설명) 튜플
     """
     try:
+        # 태그/라벨 확인
+        is_tag, tag_type = is_tag_or_label(text, pos, type_name)
+        
+        # 태그/라벨로 판단되면 특별 처리
+        if is_tag:
+            print(f"태그/라벨 요소 감지: '{text}' (유형: {tag_type})")
+            
+            # 태그/라벨 역할 이름 생성
+            tag_count = getattr(call_llm_for_meta, f"{tag_type}_count", 0) + 1
+            setattr(call_llm_for_meta, f"{tag_type}_count", tag_count)
+            
+            role = f"{tag_type}_{tag_count}"
+            description = f"슬라이드 {slide_number}의 {tag_type} 요소 (텍스트: '{text}')"
+            
+            return role, description
+        
         # 원본 텍스트 길이 계산 (나중에 제한으로 사용)
         original_text_length = len(text)
         max_role_length = min(original_text_length, 50)  # 역할 이름은 최대 50자 또는 원본 텍스트 길이 중 작은 값
@@ -146,14 +156,13 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
                 1. Assign a meaningful, **snake_case** role name (`role`) based on its visual function and position. Example: `main_title`, `left_detail_body_text`, `top_right_summary`, `comparison_title_right_1`
                 - If there are multiple similar elements, append `_1`, `_2`, etc. to make each role unique.
                 - DO NOT use unknown, misc, or generic labels.
-                - VERY IMPORTANT: Keep the role name within {max_role_length} characters.
+                - VERY IMPORTANT: Keep the role name within max 15 characters.
                 
                 2. Write a structural `description` that clearly explains the **role and functional purpose of this element in the overall slide template**.
                 - DO NOT mention the actual content of the text.
                 - DO NOT describe the topic (e.g. SW, DB, AI).
                 - Describe only the visual structure, layout function, importance level, and placement logic.
                 - Example: "This element is placed at the center top of the slide and serves as the main heading, establishing the visual hierarchy of the architecture overview template."
-                - VERY IMPORTANT: Keep the description within {max_desc_length} characters.
 
                 Respond with a JSON object:
                 {{
@@ -240,6 +249,161 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
         # 예상치 못한 오류 발생 시 안전하게 처리
         print(f"[Unexpected Error in call_llm_for_meta] {e}")
         return "unknown", f"오류: {str(e)[:100]}"
+        
+# 태그/라벨 카운터 초기화
+call_llm_for_meta.tag_count = 0
+call_llm_for_meta.label_count = 0
+call_llm_for_meta.cic_label_count = 0
+call_llm_for_meta.ui_element_count = 0
+
+def process_shape(shape, slide_number, slide_width, slide_height, meta, text_counter, role_counters, client, deployment_name, group_context=None):
+    """개별 도형을 처리하는 함수 (추출 로직을 분리하여 재사용성 높임)"""
+    # 그룹 도형 처리 (재귀적으로 중첩된 그룹까지 처리)
+    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+        group_id = group_context or "그룹"
+        print(f"그룹 요소 처리 중: {group_id}")
+        try:
+            for idx, shape_in_group in enumerate(shape.shapes):
+                # 그룹 내에 또 다른 그룹이 있으면 재귀적으로 처리
+                if shape_in_group.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    nested_group_context = f"{group_id}_중첩그룹{idx+1}"
+                    process_shape(shape_in_group, slide_number, slide_width, slide_height,
+                                 meta, text_counter, role_counters, client, deployment_name,
+                                 group_context=nested_group_context)
+                else:
+                    # 일반 도형 처리
+                    process_shape(shape_in_group, slide_number, slide_width, slide_height,
+                                 meta, text_counter, role_counters, client, deployment_name,
+                                 group_context=f"{group_id}_{idx+1}")
+            return
+        except Exception as e:
+            print(f"그룹 요소 처리 중 오류: {e}")
+            # 오류가 발생해도 계속 진행 (다른 방식으로 처리 시도)
+    
+    # 표 요소 처리
+    if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
+        print(f"표 요소 발견 (행: {len(shape.table.rows)}, 열: {len(shape.table.columns)})")
+        try:
+            for row_idx, row in enumerate(shape.table.rows):
+                for col_idx, cell in enumerate(row.cells):
+                    cell_text = "\n".join([p.text.strip() for p in cell.text_frame.paragraphs if p.text.strip()])
+                    if not cell_text:
+                        continue
+                        
+                    print(f"표 셀 텍스트 추출: R{row_idx+1}C{col_idx+1} - '{cell_text[:30]}{'...' if len(cell_text) > 30 else ''}'")
+                    
+                    # 위치 정보 계산 (대략적 추정)
+                    pos = {
+                        "left_percent": round(((shape.left + (col_idx * shape.width / len(shape.table.columns))) / slide_width) * 100, 2),
+                        "top_percent": round(((shape.top + (row_idx * shape.height / len(shape.table.rows))) / slide_height) * 100, 2),
+                        "width_percent": round((shape.width / len(shape.table.columns) / slide_width) * 100, 2),
+                        "height_percent": round((shape.height / len(shape.table.rows) / slide_height) * 100, 2)
+                    }
+                    
+                    type_name = "TABLE_CELL"
+                    element_id = make_element_id(slide_number, pos, type_name)
+                    
+                    # 역할 이름 생성
+                    base_role, description = call_llm_for_meta(cell_text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name)
+                    
+                    # 표 셀 컨텍스트 포함
+                    base_role = f"{base_role}_table_{row_idx+1}_{col_idx+1}"
+                    
+                    # 중복 텍스트 처리 - 텍스트 내용 자체를 키로 사용
+                    text_key = cell_text
+                    
+                    # 텍스트 내용이 이미 처리된 적 있으면 카운터 증가
+                    if text_key in text_counter:
+                        text_counter[text_key] += 1
+                        # 텍스트 키는 원본 텍스트 자체에 번호 붙이기
+                        numbered_key = f"{text_key}_{text_counter[text_key]}"
+                        # 역할 이름에도 번호 붙이기
+                        role = f"{base_role}_{text_counter[text_key]}"
+                    else:
+                        text_counter[text_key] = 1
+                        numbered_key = text_key
+                        # 첫 번째 발견에도 1을 붙여 일관성 유지
+                        role = f"{base_role}_1"
+                    
+                    # 메타데이터 저장
+                    meta["fields"][numbered_key] = {
+                        "role": role,
+                        "role_description": description,
+                        "element_id": element_id,
+                        "slide_number": slide_number,
+                        "position": pos,
+                        "type": type_name,
+                        "text_count": text_counter[text_key],  # 동일 텍스트의 몇 번째 등장인지 저장
+                        "table_info": {
+                            "row": row_idx + 1,
+                            "col": col_idx + 1,
+                            "total_rows": len(shape.table.rows),
+                            "total_cols": len(shape.table.columns)
+                        }
+                    }
+        except Exception as e:
+            print(f"표 처리 중 오류: {e}")
+        return
+    
+    # 텍스트 프레임이 없는 경우 처리 중단
+    if not hasattr(shape, "text_frame") or not shape.text_frame:
+        return
+            
+    # 전체 텍스트 프레임의 내용을 하나의 키로 추출
+    # 단, 각 단락은 보존
+    shape_text = "\n".join([p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()])
+    
+    if not shape_text:
+        return
+    
+    # 컨텍스트 정보 추가 (그룹 내부 요소인 경우)
+    context_info = f"_{group_context}" if group_context else ""
+    
+    # 위치 정보 및 유형 정보 가져오기
+    pos = get_shape_position(shape, slide_width, slide_height)
+    type_name = get_type_info(shape)
+    element_id = make_element_id(slide_number, pos, type_name)
+    
+    # 역할 이름 생성
+    base_role, description = call_llm_for_meta(shape_text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name)
+    
+    # 그룹 컨텍스트 포함
+    if group_context:
+        base_role = f"{base_role}_{group_context}"
+    
+    # 중복 텍스트 처리 - 텍스트 내용 자체를 키로 사용 (컨텍스트도 포함)
+    text_key = f"{shape_text}{context_info}"
+    
+    # 텍스트 내용이 이미 처리된 적 있으면 카운터 증가
+    if text_key in text_counter:
+        text_counter[text_key] += 1
+        # 텍스트 키는 원본 텍스트 자체에 번호 붙이기
+        numbered_key = f"{text_key}_{text_counter[text_key]}"
+        # 역할 이름에도 번호 붙이기
+        role = f"{base_role}_{text_counter[text_key]}"
+    else:
+        text_counter[text_key] = 1
+        numbered_key = text_key
+        # 첫 번째 발견에도 1을 붙여 일관성 유지
+        role = f"{base_role}_1"
+    
+    # 디버깅을 위해 추가 정보 출력
+    print(f"추출된 텍스트: '{shape_text[:50]}{'...' if len(shape_text) > 50 else ''}'")
+    print(f"생성된 역할명: '{role}' (카운트: {text_counter[text_key]})")
+    print("---")
+    
+    # 메타데이터 저장
+    meta["fields"][numbered_key] = {
+        "role": role,
+        "role_description": description,
+        "element_id": element_id,
+        "slide_number": slide_number,
+        "position": pos,
+        "type": type_name,
+        "text_count": text_counter[text_key],  # 동일 텍스트의 몇 번째 등장인지 저장
+        "in_group": True if group_context else False,
+        "group_context": group_context if group_context else None
+    }
 
 def extract_meta_info(pptx_path: str, meta_path: str):
     load_dotenv()
@@ -263,148 +427,13 @@ def extract_meta_info(pptx_path: str, meta_path: str):
         print(f"\n===== 슬라이드 {slide_number} 처리 중 =====")
         
         for shape in slide.shapes:
-            # 그룹 요소 처리 (그룹 내부의 모든 도형도 개별적으로 처리)
-            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-                print(f"그룹 요소 발견")
-                try:
-                    for shape_in_group in shape.shapes:
-                        process_shape(shape_in_group, slide_number, slide_width, slide_height, 
-                                      meta, text_counter, role_counters, client, deployment_name,
-                                      group_context="그룹_요소")
-                except Exception as e:
-                    print(f"그룹 요소 처리 중 오류: {e}")
-            
-            # 표 요소 처리
-            elif shape.shape_type == MSO_SHAPE_TYPE.TABLE:
-                print(f"표 요소 발견 (행: {shape.table.rows.count}, 열: {shape.table.columns.count})")
-                try:
-                    for row_idx, row in enumerate(shape.table.rows):
-                        for col_idx, cell in enumerate(row.cells):
-                            cell_text = "\n".join([p.text.strip() for p in cell.text_frame.paragraphs if p.text.strip()])
-                            if not cell_text:
-                                continue
-                                
-                            print(f"표 셀 텍스트 추출: R{row_idx+1}C{col_idx+1} - '{cell_text[:30]}{'...' if len(cell_text) > 30 else ''}'")
-                            
-                            # 위치 정보 계산 (대략적 추정)
-                            pos = {
-                                "left_percent": round(((shape.left + (col_idx * shape.width / shape.table.columns.count)) / slide_width) * 100, 2),
-                                "top_percent": round(((shape.top + (row_idx * shape.height / shape.table.rows.count)) / slide_height) * 100, 2),
-                                "width_percent": round((shape.width / shape.table.columns.count / slide_width) * 100, 2),
-                                "height_percent": round((shape.height / shape.table.rows.count / slide_height) * 100, 2)
-                            }
-                            
-                            type_name = "TABLE_CELL"
-                            element_id = make_element_id(slide_number, pos, type_name)
-                            
-                            # 텍스트 키 생성
-                            table_context = f"표_{row_idx+1}_{col_idx+1}"
-                            keyed_text = f"{cell_text}_표셀_{row_idx+1}_{col_idx+1}"
-                            
-                            if keyed_text not in text_counter:
-                                text_counter[keyed_text] = 1
-                                numbered_key = keyed_text
-                            else:
-                                text_counter[keyed_text] += 1
-                                numbered_key = f"{keyed_text}_{text_counter[keyed_text]}"
-                            
-                            # 역할 이름 생성
-                            base_role, description = call_llm_for_meta(cell_text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name)
-                            
-                            # 표 셀 컨텍스트 포함
-                            base_role = f"{base_role}_table_{row_idx+1}_{col_idx+1}"
-                            
-                            # 역할 이름 고유성 보장
-                            if base_role in role_counters:
-                                role_counters[base_role] += 1
-                                role = f"{base_role}_{role_counters[base_role]}"
-                            else:
-                                role_counters[base_role] = 1
-                                role = base_role
-                            
-                            # 메타데이터 저장
-                            meta["fields"][numbered_key] = {
-                                "role": role,
-                                "role_description": description,
-                                "element_id": element_id,
-                                "slide_number": slide_number,
-                                "position": pos,
-                                "type": type_name,
-                                "table_info": {
-                                    "row": row_idx + 1,
-                                    "col": col_idx + 1,
-                                    "total_rows": shape.table.rows.count,
-                                    "total_cols": shape.table.columns.count
-                                }
-                            }
-                except Exception as e:
-                    print(f"표 처리 중 오류: {e}")
-                    
-            # 일반 요소 처리
-            else:
-                process_shape(shape, slide_number, slide_width, slide_height,
-                              meta, text_counter, role_counters, client, deployment_name)
+            # 모든 도형은 process_shape로 통합 처리 (그룹 포함)
+            process_shape(shape, slide_number, slide_width, slide_height, 
+                          meta, text_counter, role_counters, client, deployment_name)
             
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"\n메타 정보가 {meta_path}에 저장되었습니다.")
-    
-def process_shape(shape, slide_number, slide_width, slide_height, meta, text_counter, role_counters, client, deployment_name, group_context=None):
-    """개별 도형을 처리하는 함수 (추출 로직을 분리하여 재사용성 높임)"""
-    if not hasattr(shape, "text_frame") or not shape.text_frame:
-        return
-            
-    # 전체 텍스트 프레임의 내용을 하나의 키로 추출
-    # 단, 각 단락은 보존
-    shape_text = "\n".join([p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()])
-    
-    if not shape_text:
-        return
-    
-    # 컨텍스트 정보 추가 (그룹 내부 요소인 경우)
-    context_info = f"_{group_context}" if group_context else ""
-    
-    # 텍스트 카운터 및 키 생성
-    keyed_text = f"{shape_text}{context_info}"
-    if keyed_text not in text_counter:
-        text_counter[keyed_text] = 1
-        numbered_key = keyed_text
-    else:
-        text_counter[keyed_text] += 1
-        numbered_key = f"{keyed_text}_{text_counter[keyed_text]}"
-            
-    pos = get_shape_position(shape, slide_width, slide_height)
-    type_name = get_type_info(shape)
-    element_id = make_element_id(slide_number, pos, type_name)
-    
-    # 역할 이름 생성
-    base_role, description = call_llm_for_meta(shape_text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name)
-    
-    # 그룹 컨텍스트 포함
-    if group_context:
-        base_role = f"{base_role}_{group_context}"
-    
-    # 역할 이름 고유성 보장
-    if base_role in role_counters:
-        role_counters[base_role] += 1
-        role = f"{base_role}_{role_counters[base_role]}"
-    else:
-        role_counters[base_role] = 1
-        role = base_role
-    
-    # 디버깅을 위해 추가 정보 출력
-    print(f"추출된 텍스트: '{shape_text[:50]}{'...' if len(shape_text) > 50 else ''}'")
-    print(f"생성된 역할명: '{role}'")
-    print("---")
-    
-    meta["fields"][numbered_key] = {
-        "role": role,
-        "role_description": description,
-        "element_id": element_id,
-        "slide_number": slide_number,
-        "position": pos,
-        "type": type_name
-    }
 
 def main():
     INPUT_DIR ="{input_diretory_path}"
