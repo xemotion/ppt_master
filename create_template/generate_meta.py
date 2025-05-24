@@ -4,7 +4,9 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from dotenv import load_dotenv
 from openai import AzureOpenAI
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
+from pathlib import Path
+import logging
 
 # 공통 모듈에서 함수 가져오기
 from ppt_common import (
@@ -12,8 +14,19 @@ from ppt_common import (
     get_type_info,
     make_element_id,
     is_tag_or_label,
-    logger
+    logger,
+    find_tag_element,
+    generate_position_key,
+    is_tag_identifier
 )
+
+# 로깅 설정
+logging.basicConfig(
+    filename="ppt_process.log",
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 def determine_element_role(shape, pos, slide_number, slide_width, slide_height, shape_type):
     """
@@ -123,8 +136,7 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
         # 원본 텍스트 길이 계산 (나중에 제한으로 사용)
         original_text_length = len(text)
         max_role_length = min(original_text_length, 50)  # 역할 이름은 최대 50자 또는 원본 텍스트 길이 중 작은 값
-        max_desc_length = original_text_length * 2  # 설명은 원본 텍스트 길이의 2배로 제한
-        
+       
         # 텍스트가 숫자로만 되어 있는지 확인
         is_number_only = text.isdigit()
         
@@ -156,7 +168,7 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
                 1. Assign a meaningful, **snake_case** role name (`role`) based on its visual function and position. Example: `main_title`, `left_detail_body_text`, `top_right_summary`, `comparison_title_right_1`
                 - If there are multiple similar elements, append `_1`, `_2`, etc. to make each role unique.
                 - DO NOT use unknown, misc, or generic labels.
-                - VERY IMPORTANT: Keep the role name within max 15 characters.
+                - VERY IMPORTANT: Keep the role name within {max_role_length} characters.
                 
                 2. Write a structural `description` that clearly explains the **role and functional purpose of this element in the overall slide template**.
                 - DO NOT mention the actual content of the text.
@@ -178,7 +190,6 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
                 "type": type_name,
                 "slide_number": slide_number,
                 "max_role_length": max_role_length,
-                "max_desc_length": max_desc_length
             }
             
             try:
@@ -211,10 +222,7 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
                         role = role[:max_role_length]
                         print(f"LLM 응답 역할 이름 길이 초과, 잘림: '{role}'")
                     
-                    if len(description) > max_desc_length:
-                        description = description[:max_desc_length]
-                        print(f"LLM 응답 설명 길이 초과, 잘림: '{description[:50]}...'")
-                    
+
                     return role, description
                 except Exception as e:
                     print(f"[Parse Error] {e}")
@@ -240,9 +248,7 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
         
         description = f"슬라이드 {slide_number}의 {vertical_pos} {horizontal_pos}에 위치한 {size_desc} {type_desc} 요소"
         
-        # 설명 길이 제한
-        if len(description) > max_desc_length:
-            description = description[:max_desc_length]
+
         
         return role_name, description
     except Exception as e:
@@ -256,192 +262,164 @@ call_llm_for_meta.label_count = 0
 call_llm_for_meta.cic_label_count = 0
 call_llm_for_meta.ui_element_count = 0
 
-def process_shape(shape, slide_number, slide_width, slide_height, meta, text_counter, role_counters, client, deployment_name, group_context=None):
-    """개별 도형을 처리하는 함수 (추출 로직을 분리하여 재사용성 높임)"""
-    # 그룹 도형 처리 (재귀적으로 중첩된 그룹까지 처리)
-    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-        group_id = group_context or "그룹"
-        print(f"그룹 요소 처리 중: {group_id}")
-        try:
-            for idx, shape_in_group in enumerate(shape.shapes):
-                # 그룹 내에 또 다른 그룹이 있으면 재귀적으로 처리
-                if shape_in_group.shape_type == MSO_SHAPE_TYPE.GROUP:
-                    nested_group_context = f"{group_id}_중첩그룹{idx+1}"
-                    process_shape(shape_in_group, slide_number, slide_width, slide_height,
-                                 meta, text_counter, role_counters, client, deployment_name,
-                                 group_context=nested_group_context)
-                else:
-                    # 일반 도형 처리
-                    process_shape(shape_in_group, slide_number, slide_width, slide_height,
-                                 meta, text_counter, role_counters, client, deployment_name,
-                                 group_context=f"{group_id}_{idx+1}")
-            return
-        except Exception as e:
-            print(f"그룹 요소 처리 중 오류: {e}")
-            # 오류가 발생해도 계속 진행 (다른 방식으로 처리 시도)
-    
-    # 표 요소 처리
-    if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
-        print(f"표 요소 발견 (행: {len(shape.table.rows)}, 열: {len(shape.table.columns)})")
-        try:
-            for row_idx, row in enumerate(shape.table.rows):
-                for col_idx, cell in enumerate(row.cells):
-                    cell_text = "\n".join([p.text.strip() for p in cell.text_frame.paragraphs if p.text.strip()])
-                    if not cell_text:
-                        continue
-                        
-                    print(f"표 셀 텍스트 추출: R{row_idx+1}C{col_idx+1} - '{cell_text[:30]}{'...' if len(cell_text) > 30 else ''}'")
-                    
-                    # 위치 정보 계산 (대략적 추정)
-                    pos = {
-                        "left_percent": round(((shape.left + (col_idx * shape.width / len(shape.table.columns))) / slide_width) * 100, 2),
-                        "top_percent": round(((shape.top + (row_idx * shape.height / len(shape.table.rows))) / slide_height) * 100, 2),
-                        "width_percent": round((shape.width / len(shape.table.columns) / slide_width) * 100, 2),
-                        "height_percent": round((shape.height / len(shape.table.rows) / slide_height) * 100, 2)
-                    }
-                    
-                    type_name = "TABLE_CELL"
-                    element_id = make_element_id(slide_number, pos, type_name)
-                    
-                    # 역할 이름 생성
-                    base_role, description = call_llm_for_meta(cell_text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name)
-                    
-                    # 표 셀 컨텍스트 포함
-                    base_role = f"{base_role}_table_{row_idx+1}_{col_idx+1}"
-                    
-                    # 중복 텍스트 처리 - 텍스트 내용 자체를 키로 사용
-                    text_key = cell_text
-                    
-                    # 텍스트 내용이 이미 처리된 적 있으면 카운터 증가
-                    if text_key in text_counter:
-                        text_counter[text_key] += 1
-                        # 텍스트 키는 원본 텍스트 자체에 번호 붙이기
-                        numbered_key = f"{text_key}_{text_counter[text_key]}"
-                        # 역할 이름에도 번호 붙이기
-                        role = f"{base_role}_{text_counter[text_key]}"
-                    else:
-                        text_counter[text_key] = 1
-                        numbered_key = text_key
-                        # 첫 번째 발견에도 1을 붙여 일관성 유지
-                        role = f"{base_role}_1"
-                    
-                    # 메타데이터 저장
-                    meta["fields"][numbered_key] = {
-                        "role": role,
-                        "role_description": description,
-                        "element_id": element_id,
-                        "slide_number": slide_number,
-                        "position": pos,
-                        "type": type_name,
-                        "text_count": text_counter[text_key],  # 동일 텍스트의 몇 번째 등장인지 저장
-                        "table_info": {
-                            "row": row_idx + 1,
-                            "col": col_idx + 1,
-                            "total_rows": len(shape.table.rows),
-                            "total_cols": len(shape.table.columns)
-                        }
-                    }
-        except Exception as e:
-            print(f"표 처리 중 오류: {e}")
-        return
-    
-    # 텍스트 프레임이 없는 경우 처리 중단
-    if not hasattr(shape, "text_frame") or not shape.text_frame:
-        return
+def generate_unique_key(text: str, position: dict) -> str:
+    """텍스트와 위치 정보를 조합하여 고유 키 생성"""
+    # 위치를 5% 단위로 반올림하여 근접 위치는 같은 키로 처리
+    left_group = round(position['left_percent'] / 5) * 5
+    top_group = round(position['top_percent'] / 5) * 5
+    return f"{text}__pos_{left_group}_{top_group}"
+
+def extract_text_from_shape(shape) -> str:
+    """도형에서 텍스트를 추출합니다."""
+    if not hasattr(shape, "text_frame"):
+        return ""
+        
+    paragraphs = [p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()]
+    return "\n".join(paragraphs)
+
+def extract_table_info(shape) -> Optional[Dict[str, Any]]:
+    """표에서 정보를 추출합니다."""
+    if shape.shape_type != MSO_SHAPE_TYPE.TABLE:
+        return None
+        
+    table_data = []
+    for row_idx, row in enumerate(shape.table.rows, 1):
+        row_data = []
+        for col_idx, cell in enumerate(row.cells, 1):
+            cell_text = "\n".join([p.text.strip() for p in cell.text_frame.paragraphs if p.text.strip()])
+            if cell_text:
+                row_data.append({
+                    "text": cell_text,
+                    "row": row_idx,
+                    "col": col_idx
+                })
+        if row_data:
+            table_data.extend(row_data)
             
-    # 전체 텍스트 프레임의 내용을 하나의 키로 추출
-    # 단, 각 단락은 보존
-    shape_text = "\n".join([p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()])
-    
-    if not shape_text:
-        return
-    
-    # 컨텍스트 정보 추가 (그룹 내부 요소인 경우)
-    context_info = f"_{group_context}" if group_context else ""
-    
-    # 위치 정보 및 유형 정보 가져오기
+    return table_data if table_data else None
+
+def process_shape(shape, slide_number: int, slide_width: int, slide_height: int) -> Optional[Dict[str, Any]]:
+    """개별 도형을 처리하고 메타 정보를 추출합니다."""
+    # 기본 위치 정보 추출
     pos = get_shape_position(shape, slide_width, slide_height)
     type_name = get_type_info(shape)
-    element_id = make_element_id(slide_number, pos, type_name)
     
-    # 역할 이름 생성
-    base_role, description = call_llm_for_meta(shape_text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name)
+    # 표 처리
+    if shape.shape_type == MSO_SHAPE_TYPE.TABLE:
+        table_info = extract_table_info(shape)
+        if table_info:
+            return {
+                "type": "table",
+                "position": pos,
+                "cells": table_info
+            }
+        return None
     
-    # 그룹 컨텍스트 포함
-    if group_context:
-        base_role = f"{base_role}_{group_context}"
+    # 텍스트 추출
+    text = extract_text_from_shape(shape)
+    if not text:
+        return None
+        
+    # 위치 기반 키 생성
+    position_key = generate_position_key(text, pos)
     
-    # 중복 텍스트 처리 - 텍스트 내용 자체를 키로 사용 (컨텍스트도 포함)
-    text_key = f"{shape_text}{context_info}"
-    
-    # 텍스트 내용이 이미 처리된 적 있으면 카운터 증가
-    if text_key in text_counter:
-        text_counter[text_key] += 1
-        # 텍스트 키는 원본 텍스트 자체에 번호 붙이기
-        numbered_key = f"{text_key}_{text_counter[text_key]}"
-        # 역할 이름에도 번호 붙이기
-        role = f"{base_role}_{text_counter[text_key]}"
-    else:
-        text_counter[text_key] = 1
-        numbered_key = text_key
-        # 첫 번째 발견에도 1을 붙여 일관성 유지
-        role = f"{base_role}_1"
-    
-    # 디버깅을 위해 추가 정보 출력
-    print(f"추출된 텍스트: '{shape_text[:50]}{'...' if len(shape_text) > 50 else ''}'")
-    print(f"생성된 역할명: '{role}' (카운트: {text_counter[text_key]})")
-    print("---")
-    
-    # 메타데이터 저장
-    meta["fields"][numbered_key] = {
-        "role": role,
-        "role_description": description,
-        "element_id": element_id,
-        "slide_number": slide_number,
-        "position": pos,
+    # 메타 정보 구성
+    return {
+        "id": make_element_id(slide_number, pos, type_name),
         "type": type_name,
-        "text_count": text_counter[text_key],  # 동일 텍스트의 몇 번째 등장인지 저장
-        "in_group": True if group_context else False,
-        "group_context": group_context if group_context else None
+        "text": text,
+        "position": pos,
+        "position_key": position_key
     }
 
-def extract_meta_info(pptx_path: str, meta_path: str):
-    load_dotenv()
-    client = AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        api_version=os.getenv("AZURE_OPENAI_VERSION"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
-    )
-    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-    prs = Presentation(pptx_path)
-    meta = {"fields": {}}
-    text_counter = {}
+def extract_meta_info(slide, slide_number: int, slide_width: int, slide_height: int) -> Dict[str, Any]:
+    """슬라이드에서 메타 정보를 추출합니다."""
+    meta_info = {
+        "slide_number": slide_number,
+        "fields": {}
+    }
     
-    # 역할 이름 카운터 추가 (고유성 보장)
-    role_counters = {}
+    # 모든 도형 처리
+    text_counts = {}  # 텍스트 중복 카운트용
     
-    for slide_number, slide in enumerate(prs.slides, 1):
-        slide_width = prs.slide_width
-        slide_height = prs.slide_height
-        
-        print(f"\n===== 슬라이드 {slide_number} 처리 중 =====")
-        
-        for shape in slide.shapes:
-            # 모든 도형은 process_shape로 통합 처리 (그룹 포함)
-            process_shape(shape, slide_number, slide_width, slide_height, 
-                          meta, text_counter, role_counters, client, deployment_name)
+    for shape in slide.shapes:
+        shape_info = process_shape(shape, slide_number, slide_width, slide_height)
+        if not shape_info:
+            continue
             
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"\n메타 정보가 {meta_path}에 저장되었습니다.")
+        if shape_info["type"] == "table":
+            # 표 셀 처리
+            for cell in shape_info["cells"]:
+                cell_text = cell["text"]
+                field_key = cell_text
+                
+                # 중복 텍스트 처리
+                if cell_text in text_counts:
+                    text_counts[cell_text] += 1
+                    field_key = f"{cell_text}_{text_counts[cell_text]}"
+                else:
+                    text_counts[cell_text] = 1
+                
+                meta_info["fields"][field_key] = {
+                    "type": "table_cell",
+                    "original_text": cell_text,
+                    "table_info": {
+                        "row": cell["row"],
+                        "col": cell["col"]
+                    },
+                    "text_count": text_counts[cell_text]
+                }
+        else:
+            # 일반 도형 처리
+            text = shape_info["text"]
+            position_key = shape_info["position_key"]
+            
+            # 위치 기반 키로 저장
+            meta_info["fields"][position_key] = {
+                "type": shape_info["type"],
+                "original_text": text,
+                "position": shape_info["position"],
+                "element_id": shape_info["id"]
+            }
+            
+            # 태그/라벨 요소 처리
+            if is_tag_identifier(text):
+                meta_info["fields"][position_key]["is_tag"] = True
+    
+    return meta_info
 
-def main():
-    INPUT_DIR ="{input_diretory_path}"
-    OUTPUT_DIR ="{output_directory_path}"
-    FILE_NAME ="2"
-    pptx_path = f"{INPUT_DIR}/{FILE_NAME}.pptx"
-    meta_path = f"{OUTPUT_DIR}/meta_{FILE_NAME}.json"
-    extract_meta_info(pptx_path, meta_path)
+def process_presentation(pptx_path: str) -> None:
+    """프레젠테이션 파일을 처리하고 메타 정보를 저장합니다."""
+    # 입력 파일 확인
+    if not os.path.exists(pptx_path):
+        raise FileNotFoundError(f"PPTX file not found: {pptx_path}")
+        
+    # 프레젠테이션 로드
+    prs = Presentation(pptx_path)
+    if not prs or not prs.slides:
+        raise ValueError("Invalid or empty presentation")
+        
+    # 출력 디렉토리 설정
+    input_stem = Path(pptx_path).stem
+    output_dir = f"output/{input_stem}"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 각 슬라이드 처리
+    for slide_number, slide in enumerate(prs.slides, 1):
+        # 메타 정보 추출
+        meta_info = extract_meta_info(slide, slide_number, prs.slide_width, prs.slide_height)
+        
+        # 메타 정보 저장
+        output_path = os.path.join(output_dir, f"{input_stem}_slide_{slide_number}_meta.json")
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(meta_info, f, ensure_ascii=False, indent=2)
+            
+        logger.info(f"슬라이드 {slide_number} 메타 정보 저장 완료: {output_path}")
+        print(f"슬라이드 {slide_number} 메타 정보 저장 완료: {output_path}")
+    
+    print(f"모든 슬라이드의 메타 정보 저장 완료. 폴더: {output_dir}")
 
 if __name__ == "__main__":
-    main() 
+    # 테스트용 PPTX 파일 경로
+    test_pptx = "input/test.pptx"
+    process_presentation(test_pptx) 
