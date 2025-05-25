@@ -13,11 +13,10 @@ from ppt_common import (
     get_shape_position,
     get_type_info,
     make_element_id,
-    is_tag_or_label,
     logger,
-    find_tag_element,
     generate_position_key,
-    is_tag_identifier
+    is_tag_identifier,
+    is_special_content
 )
 
 # 로깅 설정
@@ -98,62 +97,74 @@ def determine_element_role(shape, pos, slide_number, slide_width, slide_height, 
     # 일반적인 이름 생성 (슬라이드 번호 제외)
     return f"{vertical_pos}_{horizontal_pos}_{size}_{functional_role}"
 
-def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_height, client, deployment_name):
+def get_position_category(pos):
+    """위치에 따른 카테고리를 더 세분화하여 반환합니다."""
+    # 수직 위치를 5개 구간으로 나눔
+    if pos["top_percent"] < 20:
+        vertical = "top"
+    elif pos["top_percent"] < 40:
+        vertical = "upper"
+    elif pos["top_percent"] < 60:
+        vertical = "middle"
+    elif pos["top_percent"] < 80:
+        vertical = "lower"
+    else:
+        vertical = "bottom"
+    
+    # 수평 위치를 5개 구간으로 나눔
+    if pos["left_percent"] < 20:
+        horizontal = "far_left"
+    elif pos["left_percent"] < 40:
+        horizontal = "left"
+    elif pos["left_percent"] < 60:
+        horizontal = "center"
+    elif pos["left_percent"] < 80:
+        horizontal = "right"
+    else:
+        horizontal = "far_right"
+    
+    return vertical, horizontal
+
+def call_llm_for_meta(text, pos, type_name, slide_number, client, deployment_name):
     """
     텍스트 요소에 대한 역할과 설명을 생성합니다.
     LLM API를 호출하거나 규칙 기반으로 역할을 생성합니다.
-    
-    Args:
-        text: 텍스트 내용
-        pos: 위치 정보
-        type_name: 도형 유형
-        slide_number: 슬라이드 번호
-        slide_width: 슬라이드 너비
-        slide_height: 슬라이드 높이
-        client: OpenAI 클라이언트
-        deployment_name: 배포 이름
-        
-    Returns:
-        tuple: (역할 이름, 설명) 튜플
     """
     try:
-        # 태그/라벨 확인
-        is_tag, tag_type = is_tag_or_label(text, pos, type_name)
+        # 위치 카테고리 가져오기
+        vertical, horizontal = get_position_category(pos)
         
-        # 태그/라벨로 판단되면 특별 처리
-        if is_tag:
-            print(f"태그/라벨 요소 감지: '{text}' (유형: {tag_type})")
+        # 위치별 카운터 초기화 (없으면 생성)
+        if not hasattr(call_llm_for_meta, 'position_counters'):
+            call_llm_for_meta.position_counters = {}
+        
+        position_key = f"{vertical}_{horizontal}"
+        if position_key not in call_llm_for_meta.position_counters:
+            call_llm_for_meta.position_counters[position_key] = {}
+        
+        # 태그/라벨 확인
+        if is_tag_identifier(text):
+            print(f"태그/라벨 요소 감지: '{text}'")
             
-            # 태그/라벨 역할 이름 생성
-            tag_count = getattr(call_llm_for_meta, f"{tag_type}_count", 0) + 1
-            setattr(call_llm_for_meta, f"{tag_type}_count", tag_count)
+            # 태그 카운터 증가
+            if 'tag' not in call_llm_for_meta.position_counters[position_key]:
+                call_llm_for_meta.position_counters[position_key]['tag'] = 0
+            call_llm_for_meta.position_counters[position_key]['tag'] += 1
             
-            role = f"{tag_type}_{tag_count}"
-            description = f"슬라이드 {slide_number}의 {tag_type} 요소 (텍스트: '{text}')"
+            tag_count = call_llm_for_meta.position_counters[position_key]['tag']
+            role = f"{vertical}_{horizontal}_tag_{tag_count}"
+            description = f"슬라이드 {slide_number}의 태그 요소 (텍스트: '{text}')"
             
             return role, description
-        
-        # 원본 텍스트 길이 계산 (나중에 제한으로 사용)
-        original_text_length = len(text)
-        max_role_length = min(original_text_length, 50)  # 역할 이름은 최대 50자 또는 원본 텍스트 길이 중 작은 값
-       
-        # 텍스트가 숫자로만 되어 있는지 확인
-        is_number_only = text.isdigit()
-        
-        # 텍스트가 1-2글자 특수기호인지 확인
-        is_special_char = len(text) <= 2 and not text.isalnum()
-        
-        # 숫자만 있거나 1-2글자 특수기호인 경우 원본 텍스트를 role로 사용
-        if is_number_only or is_special_char:
-            return text, f"슬라이드 {slide_number}의 특수 요소 (위치: {pos['left_percent']:.1f}%, {pos['top_percent']:.1f}%)"
-        
-        # 의미있는 역할 이름 생성
-        role_name = determine_element_role(None, pos, slide_number, slide_width, slide_height, type_name)
-        
-        # 역할 이름 길이 제한
-        if len(role_name) > max_role_length:
-            role_name = role_name[:max_role_length]
-            print(f"역할 이름 길이 제한: '{role_name}'")
+                
+        # 숫자나 특수 기호로만 된 내용 체크
+        if is_special_content(text):
+            print(f"특수 콘텐츠 감지: '{text}'")
+            
+            # 특수 콘텐츠는 role을 원본 텍스트로 사용
+            role = text
+            description = f"슬라이드 {slide_number}의 특수 콘텐츠 (원본: '{text}', 위치: {pos['left_percent']:.1f}%, {pos['top_percent']:.1f}%)"
+            return role, description
         
         # LLM API 호출 여부 확인
         use_llm = True  # LLM 호출 활성화
@@ -165,16 +176,27 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
                 You will receive a text element from a presentation slide along with its position and shape information.
 
                 Your task is to:
-                1. Assign a meaningful, **snake_case** role name (`role`) based on its visual function and position. Example: `main_title`, `left_detail_body_text`, `top_right_summary`, `comparison_title_right_1`
-                - If there are multiple similar elements, append `_1`, `_2`, etc. to make each role unique.
-                - DO NOT use unknown, misc, or generic labels.
-                - VERY IMPORTANT: Keep the role name within {max_role_length} characters.
+                1. Assign a descriptive role name (`role`) based on its function and type. 
+                Important rules for role names:
+                - Format: [vertical]_[horizontal]_[type]_[index]
+                - Vertical position: {vertical}
+                - Horizontal position: {horizontal}
+                - Type: 'title', 'content', 'note', 'list', 'special'
+                - Index: Will be added automatically
+                - DO NOT include any position numbers or coordinates
+                - GOOD examples: 'upper_left_title', 'middle_center_content'
                 
                 2. Write a structural `description` that clearly explains the **role and functional purpose of this element in the overall slide template**.
                 - DO NOT mention the actual content of the text.
                 - DO NOT describe the topic (e.g. SW, DB, AI).
                 - Describe only the visual structure, layout function, importance level, and placement logic.
                 - Example: "This element is placed at the center top of the slide and serves as the main heading, establishing the visual hierarchy of the architecture overview template."
+
+                Current element information:
+                - Text: {text}
+                - Position: {pos}
+                - Type: {type_name}
+                - Slide Number: {slide_number}
 
                 Respond with a JSON object:
                 {{
@@ -188,8 +210,7 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
                 "text": text,
                 "position": pos,
                 "type": type_name,
-                "slide_number": slide_number,
-                "max_role_length": max_role_length,
+                "slide_number": slide_number
             }
             
             try:
@@ -200,67 +221,105 @@ def call_llm_for_meta(text, pos, type_name, slide_number, slide_width, slide_hei
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False, indent=2)}
                     ],
-                    temperature=0.7,
+                    temperature=0.3,  # 더 일관된 결과를 위해 temperature 낮춤
                     max_tokens=300
                 )
                 response_text = response.choices[0].message.content.strip()
-                print(f"LLM Raw Response (슬라이드 {slide_number}):", response_text)  # 응답 확인
-
-                # JSON 형식이 마크다운 코드 블록으로 감싸져 있는 경우 처리
-                if response_text.startswith("```"):
-                    response_text = response_text.split("```")[1].strip()
-                    if response_text.startswith("json"):
-                        response_text = response_text[4:].strip()
+                print(f"LLM Raw Response (슬라이드 {slide_number}):", response_text)
 
                 try:
-                    data = json.loads(response_text)
-                    role = data["role"]
+                    # 마크다운 코드 블록 제거
+                    clean_response = response_text.strip()
+                    if clean_response.startswith('```'):
+                        # 첫 번째 ``` 이후의 텍스트 추출
+                        clean_response = clean_response.split('\n', 1)[1]
+                    if clean_response.endswith('```'):
+                        # 마지막 ``` 제거
+                        clean_response = clean_response.rsplit('\n', 1)[0]
+                    # json이나 다른 언어 지정자 제거
+                    if clean_response.startswith('{'):
+                        data = json.loads(clean_response)
+                    else:
+                        # 첫 번째 { 찾기
+                        json_start = clean_response.find('{')
+                        if json_start != -1:
+                            clean_response = clean_response[json_start:]
+                            data = json.loads(clean_response)
+                        else:
+                            raise ValueError("No JSON object found in response")
+                            
+                    base_role = data["role"]
                     description = data["description"]
                     
-                    # 길이 제한 강제 적용
-                    if len(role) > max_role_length:
-                        role = role[:max_role_length]
-                        print(f"LLM 응답 역할 이름 길이 초과, 잘림: '{role}'")
+                    # role 타입 추출 및 카운터 증가
+                    role_type = base_role.split('_')[-1]  # 마지막 부분을 타입으로 사용
+                    if role_type not in call_llm_for_meta.position_counters[position_key]:
+                        call_llm_for_meta.position_counters[position_key][role_type] = 0
+                    call_llm_for_meta.position_counters[position_key][role_type] += 1
                     
-
+                    # 최종 role 생성 (카운터 포함)
+                    role = f"{base_role}_{call_llm_for_meta.position_counters[position_key][role_type]}"
+                    
                     return role, description
                 except Exception as e:
                     print(f"[Parse Error] {e}")
                     print(f"[RAW Response] {response_text}")
-                    return role_name, f"JSON 파싱 오류: {str(e)[:100]}"
+                    
+                    # 특수 문자나 숫자만 있는 경우 원본 텍스트를 role로 사용
+                    if is_special_content(text):
+                        return text, f"슬라이드 {slide_number}의 특수 콘텐츠 (원본: '{text}', 위치: {pos['left_percent']:.1f}%, {pos['top_percent']:.1f}%)"
+                    
+                    # 일반 텍스트의 경우 기본 role 생성
+                    if 'content' not in call_llm_for_meta.position_counters[position_key]:
+                        call_llm_for_meta.position_counters[position_key]['content'] = 0
+                    call_llm_for_meta.position_counters[position_key]['content'] += 1
+                    
+                    default_role = f"{vertical}_{horizontal}_content_{call_llm_for_meta.position_counters[position_key]['content']}"
+                    return default_role, f"JSON 파싱 오류로 인한 기본 역할 생성: {str(e)[:100]}"
             except Exception as e:
                 print(f"[LLM API Error] {e}")
-                return role_name, f"LLM API 오류: {str(e)[:100]}"
+                # API 호출 실패 시 기본 role 생성
+                if 'content' not in call_llm_for_meta.position_counters[position_key]:
+                    call_llm_for_meta.position_counters[position_key]['content'] = 0
+                call_llm_for_meta.position_counters[position_key]['content'] += 1
+                
+                default_role = f"{vertical}_{horizontal}_content_{call_llm_for_meta.position_counters[position_key]['content']}"
+                return default_role, f"LLM API 오류로 인한 기본 역할 생성: {str(e)[:100]}"
         
-        # LLM을 사용하지 않거나 호출에 실패한 경우 의미 있는 description 생성
-        vertical_pos = "상단" if pos["top_percent"] < 20 else "하단" if pos["top_percent"] > 70 else "중간"
-        horizontal_pos = "좌측" if pos["left_percent"] < 30 else "우측" if pos["left_percent"] > 60 else "중앙"
-        size_desc = "주요" if pos["width_percent"] > 70 or pos["height_percent"] > 30 else "보조" if pos["width_percent"] > 40 or pos["height_percent"] > 15 else "세부"
+        # LLM을 사용하지 않거나 호출에 실패한 경우 의미 있는 role 생성
+        size_desc = "main" if pos["width_percent"] > 70 or pos["height_percent"] > 30 else "sub" if pos["width_percent"] > 40 or pos["height_percent"] > 15 else "detail"
         
         type_desc = {
-            "TEXT_BOX": "텍스트",
-            "AUTO_SHAPE": "도형",
-            "PICTURE": "이미지",
-            "GROUP": "그룹",
-            "TABLE": "표",
-            "CHART": "차트"
-        }.get(type_name, "요소")
+            "TEXT_BOX": "content",
+            "AUTO_SHAPE": "shape",
+            "PICTURE": "image",
+            "GROUP": "group",
+            "TABLE": "table",
+            "CHART": "chart"
+        }.get(type_name, "element")
         
-        description = f"슬라이드 {slide_number}의 {vertical_pos} {horizontal_pos}에 위치한 {size_desc} {type_desc} 요소"
+        # 타입별 카운터 증가
+        if type_desc not in call_llm_for_meta.position_counters[position_key]:
+            call_llm_for_meta.position_counters[position_key][type_desc] = 0
+        call_llm_for_meta.position_counters[position_key][type_desc] += 1
         
-
+        # 최종 role 생성
+        role_name = f"{vertical}_{horizontal}_{size_desc}_{type_desc}_{call_llm_for_meta.position_counters[position_key][type_desc]}"
+        description = f"슬라이드 {slide_number}의 {vertical} {horizontal}에 위치한 {size_desc} {type_desc} 요소"
         
         return role_name, description
     except Exception as e:
         # 예상치 못한 오류 발생 시 안전하게 처리
         print(f"[Unexpected Error in call_llm_for_meta] {e}")
-        return "unknown", f"오류: {str(e)[:100]}"
+        if 'error' not in call_llm_for_meta.position_counters[position_key]:
+            call_llm_for_meta.position_counters[position_key]['error'] = 0
+        call_llm_for_meta.position_counters[position_key]['error'] += 1
         
-# 태그/라벨 카운터 초기화
-call_llm_for_meta.tag_count = 0
-call_llm_for_meta.label_count = 0
-call_llm_for_meta.cic_label_count = 0
-call_llm_for_meta.ui_element_count = 0
+        default_role = f"slide_{slide_number}_element_{call_llm_for_meta.position_counters[position_key]['error']}"
+        return default_role, f"오류: {str(e)[:100]}"
+
+# 위치 카운터 초기화
+call_llm_for_meta.position_counters = {}
 
 def generate_unique_key(text: str, position: dict) -> str:
     """텍스트와 위치 정보를 조합하여 고유 키 생성"""
@@ -269,13 +328,37 @@ def generate_unique_key(text: str, position: dict) -> str:
     top_group = round(position['top_percent'] / 5) * 5
     return f"{text}__pos_{left_group}_{top_group}"
 
-def extract_text_from_shape(shape) -> str:
-    """도형에서 텍스트를 추출합니다."""
+def extract_text_from_shape(shape) -> dict:
+    """도형에서 텍스트와 폰트 컬러를 추출합니다."""
     if not hasattr(shape, "text_frame"):
-        return ""
+        return {"text": "", "font_color": (0, 0, 0)}
+    
+    text_parts = []
+    font_colors = []
+    
+    for paragraph in shape.text_frame.paragraphs:
+        paragraph_runs = []
+        paragraph_color = None
         
-    paragraphs = [p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()]
-    return "\n".join(paragraphs)
+        for run in paragraph.runs:
+            if run.text and run.text.strip():
+                paragraph_runs.append(run.text.strip())
+                # 폰트 컬러 추출
+                try:
+                    if hasattr(run.font, 'color') and run.font.color and hasattr(run.font.color, 'rgb'):
+                        paragraph_color = run.font.color.rgb
+                except AttributeError:
+                    pass
+        
+        if paragraph_runs:
+            text_parts.append(" ".join(paragraph_runs))
+            font_colors.append(paragraph_color or (0, 0, 0))  # 기본값은 검정색
+    
+    # 모든 paragraph의 텍스트를 합치고, 첫 번째 유효한 폰트 컬러 사용
+    return {
+        "text": "\n".join(text_parts),
+        "font_color": font_colors[0] if font_colors else (0, 0, 0)
+    }
 
 def extract_table_info(shape) -> Optional[Dict[str, Any]]:
     """표에서 정보를 추출합니다."""
@@ -316,110 +399,114 @@ def process_shape(shape, slide_number: int, slide_width: int, slide_height: int)
         return None
     
     # 텍스트 추출
-    text = extract_text_from_shape(shape)
-    if not text:
+    text_info = extract_text_from_shape(shape)
+    if not text_info["text"]:
         return None
         
     # 위치 기반 키 생성
-    position_key = generate_position_key(text, pos)
+    position_key = generate_position_key(text_info["text"], pos)
     
     # 메타 정보 구성
     return {
         "id": make_element_id(slide_number, pos, type_name),
         "type": type_name,
-        "text": text,
+        "text": text_info["text"],
         "position": pos,
-        "position_key": position_key
+        "position_key": position_key,
+        "font_color": text_info["font_color"]
     }
 
 def extract_meta_info(slide, slide_number: int, slide_width: int, slide_height: int) -> Dict[str, Any]:
-    """슬라이드에서 메타 정보를 추출합니다."""
+    """단일 슬라이드에서 메타 정보를 추출합니다."""
     meta_info = {
         "slide_number": slide_number,
+        "slide_width": slide_width,
+        "slide_height": slide_height,
         "fields": {}
     }
-    
+
+    # OpenAI 클라이언트 설정
+    load_dotenv()
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version=os.getenv("AZURE_OPENAI_VERSION"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+
     # 모든 도형 처리
     text_counts = {}  # 텍스트 중복 카운트용
     
     for shape in slide.shapes:
-        shape_info = process_shape(shape, slide_number, slide_width, slide_height)
-        if not shape_info:
+        # 도형의 텍스트와 폰트 컬러 추출
+        if not hasattr(shape, "text_frame"):
             continue
             
-        if shape_info["type"] == "table":
-            # 표 셀 처리
-            for cell in shape_info["cells"]:
-                cell_text = cell["text"]
-                field_key = cell_text
-                
-                # 중복 텍스트 처리
-                if cell_text in text_counts:
-                    text_counts[cell_text] += 1
-                    field_key = f"{cell_text}_{text_counts[cell_text]}"
-                else:
-                    text_counts[cell_text] = 1
-                
-                meta_info["fields"][field_key] = {
-                    "type": "table_cell",
-                    "original_text": cell_text,
-                    "table_info": {
-                        "row": cell["row"],
-                        "col": cell["col"]
-                    },
-                    "text_count": text_counts[cell_text]
-                }
+        text_info = extract_text_from_shape(shape)
+        if not text_info["text"]:
+            continue
+            
+        # 도형의 위치 정보 추출
+        pos = get_shape_position(shape, slide_width, slide_height)
+        position_key = generate_position_key(text_info["text"], pos)
+        
+        # 텍스트 중복 처리
+        if text_info["text"] in text_counts:
+            text_counts[text_info["text"]] += 1
+            position_key = f"{position_key}_{text_counts[text_info['text']]}"
         else:
-            # 일반 도형 처리
-            text = shape_info["text"]
-            position_key = shape_info["position_key"]
-            
-            # 위치 기반 키로 저장
-            meta_info["fields"][position_key] = {
-                "type": shape_info["type"],
-                "original_text": text,
-                "position": shape_info["position"],
-                "element_id": shape_info["id"]
-            }
-            
-            # 태그/라벨 요소 처리
-            if is_tag_identifier(text):
-                meta_info["fields"][position_key]["is_tag"] = True
-    
+            text_counts[text_info["text"]] = 1
+        
+        # 도형 유형 확인
+        type_name = MSO_SHAPE_TYPE(shape.shape_type).name if shape.shape_type in MSO_SHAPE_TYPE._value2member_map_ else "UNKNOWN"
+        
+        # role과 description 생성
+        role, description = call_llm_for_meta(
+            text=text_info["text"],
+            pos=pos,
+            type_name=type_name,
+            slide_number=slide_number,
+            client=client,
+            deployment_name=deployment_name
+        )
+        
+        # 위치 기반 키로 저장
+        meta_info["fields"][position_key] = {
+            "type": type_name,
+            "original_text": text_info["text"],
+            "position": pos,
+            "element_id": f"element_slide{slide_number}_l{int(pos['left_percent'])}_t{int(pos['top_percent'])}",
+            "role": role,
+            "role_description": description,
+            "font_color": text_info["font_color"]  # 폰트 컬러 저장
+        }
+        
+        # 태그/라벨 요소 처리
+        if is_tag_identifier(text_info["text"]):
+            meta_info["fields"][position_key]["is_tag"] = True
+
     return meta_info
 
-def process_presentation(pptx_path: str) -> None:
-    """프레젠테이션 파일을 처리하고 메타 정보를 저장합니다."""
-    # 입력 파일 확인
-    if not os.path.exists(pptx_path):
-        raise FileNotFoundError(f"PPTX file not found: {pptx_path}")
-        
-    # 프레젠테이션 로드
-    prs = Presentation(pptx_path)
-    if not prs or not prs.slides:
-        raise ValueError("Invalid or empty presentation")
-        
-    # 출력 디렉토리 설정
-    input_stem = Path(pptx_path).stem
-    output_dir = f"output/{input_stem}"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 각 슬라이드 처리
-    for slide_number, slide in enumerate(prs.slides, 1):
+def process_meta_info(prs, slide_number, slide, slide_width, slide_height):
+    """
+    단일 슬라이드의 메타 정보를 추출하고 처리합니다.
+    """
+    try:
         # 메타 정보 추출
-        meta_info = extract_meta_info(slide, slide_number, prs.slide_width, prs.slide_height)
-        
-        # 메타 정보 저장
-        output_path = os.path.join(output_dir, f"{input_stem}_slide_{slide_number}_meta.json")
+        meta_info = extract_meta_info(slide, slide_number, slide_width, slide_height)
+        return meta_info
+    except Exception as e:
+        logger.error(f"슬라이드 {slide_number} 메타 정보 추출 중 오류: {str(e)}")
+        raise
+
+def save_meta_info(meta_info, output_path):
+    """
+    메타 정보를 JSON 파일로 저장합니다.
+    """
+    try:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(meta_info, f, ensure_ascii=False, indent=2)
-            
-        logger.info(f"슬라이드 {slide_number} 메타 정보 저장 완료: {output_path}")
-        print(f"슬라이드 {slide_number} 메타 정보 저장 완료: {output_path}")
-    
-    print(f"모든 슬라이드의 메타 정보 저장 완료. 폴더: {output_dir}")
-
-if __name__ == "__main__":
-    # 테스트용 PPTX 파일 경로
-    test_pptx = "input/test.pptx"
-    process_presentation(test_pptx) 
+        logger.info(f"메타 정보 저장 완료: {output_path}")
+    except Exception as e:
+        logger.error(f"메타 정보 저장 중 오류: {str(e)}")
+        raise 
